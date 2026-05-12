@@ -33,6 +33,7 @@ mod validation;
 mod web3;
 
 pub use testing::{TestingBuildBlockRequestV1, TESTING_BUILD_BLOCK_V1};
+pub use validation::{BuilderBlockValidationRequestV6, SignedBidSubmissionV6};
 
 /// re-export of all server traits
 pub use servers::*;

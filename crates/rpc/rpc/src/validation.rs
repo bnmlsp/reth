@@ -1,7 +1,11 @@
 use alloy_consensus::{
     BlobTransactionValidationError, BlockHeader, EnvKzgSettings, Transaction, TxReceipt,
 };
-use alloy_eips::{eip4844::kzg_to_versioned_hash, eip7685::RequestsOrHash};
+use alloy_eips::{
+    eip4844::kzg_to_versioned_hash,
+    eip7685::RequestsOrHash,
+    eip7928::{bal::DecodedBal, compute_block_access_list_hash},
+};
 use alloy_primitives::map::AddressSet;
 use alloy_rpc_types_beacon::relay::{
     BidTrace, BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
@@ -34,7 +38,7 @@ use reth_primitives_traits::{
     SealedBlock, SealedHeaderFor,
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
-use reth_rpc_api::BlockSubmissionValidationApiServer;
+use reth_rpc_api::{BlockSubmissionValidationApiServer, BuilderBlockValidationRequestV6};
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::Runtime;
@@ -127,6 +131,7 @@ where
         block: RecoveredBlock<<E::Primitives as NodePrimitives>::Block>,
         message: BidTrace,
         registered_gas_limit: u64,
+        decoded_bal: Option<DecodedBal>,
     ) -> Result<(), ValidationApiError> {
         self.validate_message_against_header(block.sealed_header(), &message)?;
 
@@ -179,11 +184,31 @@ where
 
         let mut request_cache = self.cached_reads(parent_header_hash).await;
 
-        let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
-        let executor = self.evm_config.batch_executor(cached_db);
+        let (output, block_access_list_hash, accessed_blacklisted) = {
+            let cached_db = request_cache.as_db_mut(StateProviderDatabase::new(&state_provider));
+            let mut executor = self.evm_config.batch_executor(cached_db);
 
-        let mut accessed_blacklisted = None;
-        let output = executor.execute_with_state_closure(&block, |state| {
+            let result = executor.execute_one(&block)?;
+            let rebuilt_bal = executor.take_bal();
+            let mut state = executor.into_state();
+
+            if let Some(decoded_bal) = decoded_bal.as_ref() {
+                let rebuilt_bal = rebuilt_bal.ok_or_else(|| {
+                    ConsensusError::BlockAccessListHashMismatch(
+                        GotExpected::new(B256::ZERO, decoded_bal.hash()).into(),
+                    )
+                })?;
+
+                if rebuilt_bal != decoded_bal.as_bal().as_slice() {
+                    let rebuilt = compute_block_access_list_hash(&rebuilt_bal);
+                    return Err(ConsensusError::BlockAccessListHashMismatch(
+                        GotExpected::new(rebuilt, decoded_bal.hash()).into(),
+                    )
+                    .into())
+                }
+            }
+
+            let mut accessed_blacklisted = None;
             if !self.disallow.is_empty() {
                 // Check whether the submission interacted with any blacklisted account by scanning
                 // the `State`'s cache that records everything read from database during execution.
@@ -193,7 +218,11 @@ where
                     }
                 }
             }
-        })?;
+
+            let block_access_list_hash = decoded_bal.as_ref().map(|decoded_bal| decoded_bal.hash());
+            let output = BlockExecutionOutput { state: state.take_bundle(), result };
+            (output, block_access_list_hash, accessed_blacklisted)
+        };
 
         if let Some(account) = accessed_blacklisted {
             return Err(ValidationApiError::Blacklist(account))
@@ -202,7 +231,12 @@ where
         // update the cached reads
         self.update_cached_reads(parent_header_hash, request_cache).await;
 
-        self.consensus.validate_block_post_execution(&block, &output, None, None)?;
+        self.consensus.validate_block_post_execution(
+            &block,
+            &output,
+            None,
+            block_access_list_hash,
+        )?;
 
         self.ensure_payment(&block, &output, &message)?;
 
@@ -403,6 +437,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            None,
         )
         .await
     }
@@ -431,6 +466,7 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            None,
         )
         .await
     }
@@ -471,6 +507,51 @@ where
             block,
             request.request.message,
             request.registered_gas_limit,
+            None,
+        )
+        .await
+    }
+
+    /// Core logic for validating the builder submission v6
+    async fn validate_builder_submission_v6(
+        &self,
+        request: BuilderBlockValidationRequestV6,
+    ) -> Result<(), ValidationApiError> {
+        let decoded_bal =
+            DecodedBal::from_rlp_bytes(request.request.execution_payload.block_access_list.clone())
+                .map_err(ValidationApiError::InvalidBlockAccessList)?;
+
+        let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
+            payload: ExecutionPayload::V4(request.request.execution_payload),
+            sidecar: ExecutionPayloadSidecar::v4(
+                CancunPayloadFields {
+                    parent_beacon_block_root: request.parent_beacon_block_root,
+                    versioned_hashes: self
+                        .validate_blobs_bundle_v2(request.request.blobs_bundle)?,
+                },
+                PraguePayloadFields {
+                    requests: RequestsOrHash::Requests(
+                        request.request.execution_requests.to_requests(),
+                    ),
+                },
+            ),
+        })?;
+
+        let chain_spec = self.provider.chain_spec();
+        if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) &&
+            block.rlp_length() > MAX_RLP_BLOCK_SIZE
+        {
+            return Err(ValidationApiError::Consensus(ConsensusError::BlockTooLarge {
+                rlp_length: block.rlp_length(),
+                max_rlp_length: MAX_RLP_BLOCK_SIZE,
+            }));
+        }
+
+        self.validate_message_against_block(
+            block,
+            request.request.message,
+            request.registered_gas_limit,
+            Some(decoded_bal),
         )
         .await
     }
@@ -549,6 +630,24 @@ where
 
         self.task_spawner.spawn_blocking_task(async move {
             let result = Self::validate_builder_submission_v5(&this, request)
+                .await
+                .map_err(ErrorObject::from);
+            let _ = tx.send(result);
+        });
+
+        rx.await.map_err(|_| internal_rpc_err("Internal blocking task error"))?
+    }
+
+    /// Validates a block submitted to the relay
+    async fn validate_builder_submission_v6(
+        &self,
+        request: BuilderBlockValidationRequestV6,
+    ) -> RpcResult<()> {
+        let this = self.clone();
+        let (tx, rx) = oneshot::channel();
+
+        self.task_spawner.spawn_blocking_task(async move {
+            let result = Self::validate_builder_submission_v6(&this, request)
                 .await
                 .map_err(ErrorObject::from);
             let _ = tx.send(result);
@@ -646,6 +745,8 @@ pub enum ValidationApiError {
     ProposerPayment,
     #[error("invalid blobs bundle")]
     InvalidBlobsBundle,
+    #[error("invalid block access list: {_0}")]
+    InvalidBlockAccessList(alloy_rlp::Error),
     #[error("block accesses blacklisted address: {_0}")]
     Blacklist(Address),
     #[error(transparent)]
@@ -670,6 +771,7 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             ValidationApiError::Blacklist(_) |
             ValidationApiError::ProposerPayment |
             ValidationApiError::InvalidBlobsBundle |
+            ValidationApiError::InvalidBlockAccessList(_) |
             ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
 
             ValidationApiError::MissingLatestBlock |
