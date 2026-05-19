@@ -3,6 +3,8 @@
 use crate::ExecutionOutcome;
 use alloc::{borrow::Cow, collections::BTreeMap, vec::Vec};
 use alloy_consensus::{transaction::Recovered, BlockHeader, TxReceipt};
+#[cfg(feature = "traces")]
+use alloy_rpc_types_trace::geth::CallFrame;
 use alloy_eips::{eip1898::ForkBlock, eip2718::Encodable2718, BlockNumHash};
 use alloy_primitives::{Address, BlockHash, BlockNumber, Log, TxHash};
 use core::{fmt, ops::RangeInclusive};
@@ -38,6 +40,14 @@ pub struct Chain<N: NodePrimitives = reth_ethereum_primitives::EthPrimitives> {
     ///
     /// Contains handles to lazily-initialized sorted trie updates and hashed state.
     trie_data: BTreeMap<BlockNumber, LazyTrieData>,
+    /// Call traces per block, collected during Engine path execution.
+    ///
+    /// Always populated for Engine path blocks regardless of whether any ExEx subscribers exist.
+    /// `None` for historical (pipeline) blocks and reorg old-chain blocks.
+    /// Not persisted to WAL (skipped by serde).
+    #[cfg(feature = "traces")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    call_traces: Option<BTreeMap<BlockNumber, Vec<CallFrame>>>,
 }
 
 type ChainTxReceiptMeta<'a, N> = (
@@ -53,6 +63,8 @@ impl<N: NodePrimitives> Default for Chain<N> {
             blocks: Default::default(),
             execution_outcome: Default::default(),
             trie_data: Default::default(),
+            #[cfg(feature = "traces")]
+            call_traces: None,
         }
     }
 }
@@ -72,7 +84,13 @@ impl<N: NodePrimitives> Chain<N> {
             blocks.into_iter().map(|b| (b.header().number(), b)).collect::<BTreeMap<_, _>>();
         debug_assert!(!blocks.is_empty(), "Chain should have at least one block");
 
-        Self { blocks, execution_outcome, trie_data }
+        Self {
+            blocks,
+            execution_outcome,
+            trie_data,
+            #[cfg(feature = "traces")]
+            call_traces: None,
+        }
     }
 
     /// Create new Chain from a single block and its state.
@@ -83,6 +101,30 @@ impl<N: NodePrimitives> Chain<N> {
     ) -> Self {
         let block_number = block.header().number();
         Self::new([block], execution_outcome, BTreeMap::from([(block_number, trie_data)]))
+    }
+
+    /// Attaches call traces collected during Engine path execution.
+    ///
+    /// After this call, [`Self::call_traces`] returns `Some`. Replaces any previously set traces.
+    #[cfg(feature = "traces")]
+    pub fn with_call_traces(
+        mut self,
+        traces: BTreeMap<BlockNumber, Vec<CallFrame>>,
+    ) -> Self {
+        self.call_traces = Some(traces);
+        self
+    }
+
+    /// Returns call traces for all blocks, if available.
+    ///
+    /// Returns `None` for pipeline (historical) blocks and reorg old-chain blocks.
+    /// When `Some`, the map may not contain an entry for every block: a missing block number
+    /// means that block had no traces (e.g. it was a pipeline block), not that traces were lost.
+    #[cfg(feature = "traces")]
+    pub fn call_traces(
+        &self,
+    ) -> Option<&BTreeMap<BlockNumber, Vec<CallFrame>>> {
+        self.call_traces.as_ref()
     }
 
     /// Get the blocks in this chain.
@@ -338,6 +380,9 @@ impl<N: NodePrimitives> Chain<N> {
     ///
     /// Returns the passed `other` chain in [`Result::Err`] variant if the chains could not be
     /// connected.
+    ///
+    /// Note: `call_traces` from `other` are not merged. The Engine path does not call
+    /// `append_chain`; this is safe for current usage. See OPT-2 in the design doc.
     pub fn append_chain(&mut self, other: Self) -> Result<(), Self> {
         let chain_tip = self.tip();
         let other_fork_block = other.fork_block();
@@ -349,6 +394,11 @@ impl<N: NodePrimitives> Chain<N> {
         self.blocks.extend(other.blocks);
         self.execution_outcome.extend(other.execution_outcome);
         self.trie_data.extend(other.trie_data);
+        #[cfg(feature = "traces")]
+        assert!(
+            other.call_traces.is_none(),
+            "append_chain drops call_traces from other; caller must ensure other has no traces"
+        );
 
         Ok(())
     }
@@ -517,6 +567,13 @@ pub(super) mod serde_bincode_compat {
             BlockNumber,
             reth_trie_common::serde_bincode_compat::hashed_state::HashedPostStateSorted<'a>,
         >,
+        /// Traces are not persisted to WAL; skipped in bincode round-trips.
+        /// Field must exist in the struct so that `From`/`Into` impls compile; it has no runtime
+        /// value.
+        #[cfg(feature = "traces")]
+        #[serde(skip)]
+        #[allow(dead_code)]
+        call_traces: (),
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -552,6 +609,8 @@ pub(super) mod serde_bincode_compat {
                     .iter()
                     .map(|(k, v)| (*k, v.get().hashed_state.as_ref().into()))
                     .collect(),
+                #[cfg(feature = "traces")]
+                call_traces: (),
             }
         }
     }
@@ -587,7 +646,13 @@ pub(super) mod serde_bincode_compat {
                 })
                 .collect();
 
-            Self { blocks, execution_outcome: value.execution_outcome.into(), trie_data }
+            Self {
+                blocks,
+                execution_outcome: value.execution_outcome.into(),
+                trie_data,
+                #[cfg(feature = "traces")]
+                call_traces: None,
+            }
         }
     }
 
@@ -823,5 +888,160 @@ mod tests {
 
         // Assert that the execution outcome at the tip block contains the whole execution outcome
         assert_eq!(chain.execution_outcome_at_block(11), Some(execution_outcome));
+    }
+
+    #[cfg(feature = "traces")]
+    mod traces_tests {
+        use super::*;
+        use alloy_rpc_types_trace::geth::CallFrame;
+
+        fn make_call_frame(from: Address) -> CallFrame {
+            CallFrame { from, ..Default::default() }
+        }
+
+        // T-1: with_call_traces setter stores data, call_traces getter returns it;
+        // calling twice replaces the previous value.
+        #[test]
+        fn test_with_call_traces_setter_getter() {
+            let chain: Chain = Chain::default();
+            let addr = Address::new([0x11; 20]);
+            let traces = BTreeMap::from([(1u64, vec![make_call_frame(addr)])]);
+
+            let chain = chain.with_call_traces(traces);
+
+            let got = chain.call_traces().expect("call_traces should be Some");
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[&1][0].from, addr);
+
+            // Replace semantics: second call overwrites first
+            let addr2 = Address::new([0x99; 20]);
+            let traces2 = BTreeMap::from([(2u64, vec![make_call_frame(addr2)])]);
+            let chain = chain.with_call_traces(traces2);
+            let got2 = chain.call_traces().expect("call_traces should be Some after replace");
+            assert_eq!(got2.len(), 1);
+            assert!(!got2.contains_key(&1), "old traces should be replaced");
+            assert_eq!(got2[&2][0].from, addr2);
+        }
+
+        // T-2: bincode round-trip skips call_traces (traces not persisted to WAL)
+        // Also verifies that non-traces fields (blocks) survive the round-trip intact.
+        #[cfg(feature = "serde-bincode-compat")]
+        #[test]
+        fn test_call_traces_skipped_in_bincode_roundtrip() {
+            use reth_ethereum_primitives::Block;
+            use reth_primitives_traits::RecoveredBlock;
+            use serde::{Deserialize, Serialize};
+            use serde_with::serde_as;
+
+            #[serde_as]
+            #[derive(Debug, Serialize, Deserialize)]
+            struct Data {
+                #[serde_as(as = "serde_bincode_compat::Chain")]
+                chain: Chain,
+            }
+
+            let block_hash = B256::new([0x22; 32]);
+            let mut block: RecoveredBlock<Block> = Default::default();
+            block.set_hash(block_hash);
+
+            let addr = Address::new([0x22; 20]);
+            let traces = BTreeMap::from([(1u64, vec![make_call_frame(addr)])]);
+            let chain: Chain = Chain {
+                blocks: BTreeMap::from([(1, block)]),
+                ..Default::default()
+            };
+            let chain = chain.with_call_traces(traces);
+            assert!(chain.call_traces().is_some(), "call_traces should be set before encoding");
+            assert_eq!(chain.blocks().len(), 1, "chain should have 1 block before encoding");
+
+            let data = Data { chain };
+            let encoded = bincode::serialize(&data).unwrap();
+            let decoded: Data = bincode::deserialize(&encoded).unwrap();
+
+            assert!(
+                decoded.chain.call_traces().is_none(),
+                "call_traces must be None after bincode round-trip"
+            );
+            assert_eq!(
+                decoded.chain.blocks().len(),
+                1,
+                "blocks must be preserved after bincode round-trip"
+            );
+            assert!(
+                decoded.chain.blocks().contains_key(&1),
+                "block 1 must be present after bincode round-trip"
+            );
+        }
+
+        // T-3: call_traces() returns None when with_call_traces was never called
+        #[test]
+        fn test_call_traces_none_by_default() {
+            let chain: Chain = Chain::default();
+            assert!(chain.call_traces().is_none());
+
+            let block: RecoveredBlock<reth_ethereum_primitives::Block> = Default::default();
+            let chain2: Chain =
+                Chain::new([block], ExecutionOutcome::default(), BTreeMap::new());
+            assert!(chain2.call_traces().is_none());
+        }
+
+        // T-9: append_chain preserves self.call_traces when other has none
+        #[test]
+        fn test_append_chain_preserves_self_traces() {
+            use reth_ethereum_primitives::Block;
+            use reth_primitives_traits::RecoveredBlock;
+
+            let block: RecoveredBlock<Block> = Default::default();
+            let block1_hash = B256::new([0x01; 32]);
+            let block2_hash = B256::new([0x02; 32]);
+            let block3_hash = B256::new([0x03; 32]);
+
+            let mut block1 = block.clone();
+            let mut block2 = block.clone();
+            let mut block3 = block;
+            block1.set_hash(block1_hash);
+            block2.set_hash(block2_hash);
+            block3.set_hash(block3_hash);
+            block3.set_parent_hash(block2_hash);
+
+            let addr = Address::new([0x55; 20]);
+            let traces = BTreeMap::from([(1u64, vec![make_call_frame(addr)])]);
+
+            let mut chain_self: Chain = Chain {
+                blocks: BTreeMap::from([(1, block1), (2, block2)]),
+                ..Default::default()
+            };
+            chain_self = chain_self.with_call_traces(traces);
+
+            // other has no traces (pipeline block)
+            let chain_other: Chain =
+                Chain { blocks: BTreeMap::from([(3, block3)]), ..Default::default() };
+
+            assert!(chain_self.append_chain(chain_other).is_ok());
+
+            // self.call_traces must survive append_chain
+            let got = chain_self.call_traces().expect("call_traces should be preserved after append_chain");
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[&1][0].from, addr);
+        }
+
+        // L-F: with_call_traces → call_traces() round-trip through Chain::new (Commit path analog)
+        #[test]
+        fn test_chain_new_then_with_call_traces_readable() {
+            use reth_ethereum_primitives::Block;
+            use reth_primitives_traits::RecoveredBlock;
+
+            let block: RecoveredBlock<Block> = Default::default();
+            let addr = Address::new([0xCC; 20]);
+            let traces = BTreeMap::from([(0u64, vec![make_call_frame(addr)])]);
+
+            let chain: Chain =
+                Chain::new([block], ExecutionOutcome::default(), BTreeMap::new());
+            let chain = chain.with_call_traces(traces);
+
+            let got = chain.call_traces().expect("call_traces should be readable after Chain::new + with_call_traces");
+            assert_eq!(got[&0][0].from, addr);
+        }
+
     }
 }

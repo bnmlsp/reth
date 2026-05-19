@@ -47,7 +47,7 @@ use crate::tree::{
     CacheWaitDurations, CachedStateProvider, EngineApiMetrics, EngineApiTreeState, ExecutionEnv,
     PayloadHandle, StateProviderBuilder, StateProviderDatabase, TreeConfig, WaitForCaches,
 };
-use alloy_consensus::transaction::{Either, TxHashRef};
+use alloy_consensus::transaction::Either;
 use alloy_eip7928::{
     bal::{Bal, DecodedBal},
     BlockAccessList,
@@ -90,12 +90,14 @@ use reth_revm::db::{states::bundle_state::BundleRetention, BundleAccount, State}
 use reth_trie::{trie_cursor::TrieCursorFactory, updates::TrieUpdates, HashedPostState};
 use reth_trie_db::ChangesetCache;
 use reth_trie_parallel::root::{ParallelStateRoot, ParallelStateRootError};
+use alloy_rpc_types_trace::geth::CallFrame;
+use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use revm_primitives::{Address, KECCAK_EMPTY};
 use std::{
     collections::HashMap,
     panic::{self, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::Ordering,
         mpsc::RecvTimeoutError,
         Arc,
     },
@@ -568,7 +570,7 @@ where
         // The receipt root task is spawned before execution and receives receipts incrementally
         // as transactions complete, allowing parallel computation during execution.
         let execute_block_start = Instant::now();
-        let (output, senders, receipt_root_rx) =
+        let (output, senders, receipt_root_rx, call_traces) =
             match self.execute_block(state_provider, env, &input, &mut handle) {
                 Ok(output) => output,
                 Err(err) => return self.handle_execution_error(input, err, &parent_block),
@@ -843,6 +845,7 @@ where
             hashed_state,
             trie_output,
             changeset_provider,
+            call_traces,
         );
         Ok((executed_block, timing_stats))
     }
@@ -906,6 +909,7 @@ where
             BlockExecutionOutput<N::Receipt>,
             Vec<Address>,
             tokio::sync::oneshot::Receiver<(B256, alloy_primitives::Bloom)>,
+            Option<Vec<CallFrame>>,
         ),
         InsertBlockErrorKind,
     >
@@ -925,36 +929,6 @@ where
                 .build()
         });
 
-        let (spec_id, mut executor) = {
-            let _span = debug_span!(target: "engine::tree", "create_evm").entered();
-            let spec_id = *env.evm_env.spec_id();
-            let evm = self.evm_config.evm_with_env(&mut db, env.evm_env);
-            let ctx = self
-                .execution_ctx_for(input)
-                .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
-            let executor = self.evm_config.create_executor(evm, ctx);
-            (spec_id, executor)
-        };
-
-        if !self.config.precompile_cache_disabled() {
-            let _span = debug_span!(target: "engine::tree", "setup_precompile_cache").entered();
-            executor.evm_mut().precompiles_mut().map_cacheable_precompiles(
-                |address, precompile| {
-                    let metrics = self
-                        .precompile_cache_metrics
-                        .entry(*address)
-                        .or_insert_with(|| CachedPrecompileMetrics::new_with_address(*address))
-                        .clone();
-                    CachedPrecompile::wrap(
-                        precompile,
-                        self.precompile_cache_map.cache_for_address(*address),
-                        spec_id,
-                        Some(metrics),
-                    )
-                },
-            );
-        }
-
         // Spawn background task to compute receipt root and logs bloom incrementally.
         // Unbounded channel is used since tx count bounds capacity anyway (max ~30k txs per block).
         let receipts_len = input.transaction_count();
@@ -967,28 +941,139 @@ where
 
         let transaction_count = input.transaction_count();
         let executed_tx_index = Arc::clone(handle.executed_tx_index());
-        let executor = executor.with_state_hook(
-            handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook>),
-        );
 
         let execution_start = Instant::now();
 
-        // Execute all transactions and finalize
-        let (executor, senders) = self.execute_transactions(
-            executor,
-            transaction_count,
-            handle.iter_transactions(),
-            &receipt_tx,
-            &executed_tx_index,
-        )?;
-        drop(receipt_tx);
+        // Inject a TracingInspector to collect per-tx call traces. inspector_mut() is used after
+        // each transaction because execute_transactions() is generic over BlockExecutor and does
+        // not expose the inspector, making TracingInspector-specific calls (geth_builder, fuse)
+        // inaccessible from there. No cfg(feature = "traces") guard here: engine-tree always
+        // enables traces (ADR-1 — see docs/design/exex-internal-txs.md).
+        let (result, senders, call_traces) = {
+            let (spec_id, executor) = {
+                let _span = debug_span!(target: "engine::tree", "create_evm").entered();
+                let spec_id = *env.evm_env.spec_id();
+                let inspector = TracingInspector::new(TracingInspectorConfig::none());
+                let evm = self
+                    .evm_config
+                    .evm_with_env_and_inspector(&mut db, env.evm_env, inspector);
+                let ctx = self
+                    .execution_ctx_for(input)
+                    .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
+                let executor = self
+                    .evm_config
+                    .create_executor(evm, ctx)
+                    .with_state_hook(
+                        handle.state_hook().map(|hook| Box::new(hook) as Box<dyn OnStateHook>),
+                    );
+                (spec_id, executor)
+            };
+            let mut executor = executor;
 
-        // Finish execution and get the result
-        let post_exec_start = Instant::now();
-        let (_evm, result) = debug_span!(target: "engine::tree", "BlockExecutor::finish")
-            .in_scope(|| executor.finish())
-            .map(|(evm, result)| (evm.into_db(), result))?;
-        self.metrics.record_post_execution(post_exec_start.elapsed());
+            if !self.config.precompile_cache_disabled() {
+                let _span =
+                    debug_span!(target: "engine::tree", "setup_precompile_cache").entered();
+                executor.evm_mut().precompiles_mut().map_cacheable_precompiles(
+                    |address, precompile| {
+                        let metrics = self
+                            .precompile_cache_metrics
+                            .entry(*address)
+                            .or_insert_with(|| {
+                                CachedPrecompileMetrics::new_with_address(*address)
+                            })
+                            .clone();
+                        CachedPrecompile::wrap(
+                            precompile,
+                            self.precompile_cache_map.cache_for_address(*address),
+                            spec_id,
+                            Some(metrics),
+                        )
+                    },
+                );
+            }
+
+            // Apply pre-execution changes (e.g. beacon root update)
+            let pre_exec_start = Instant::now();
+            debug_span!(target: "engine::tree", "pre_execution")
+                .in_scope(|| executor.apply_pre_execution_changes())
+                .map_err(BlockExecutionError::from)?;
+            self.metrics.record_pre_execution(pre_exec_start.elapsed());
+            // EIP-4788 and other system calls run through the EVM and leave nodes in the
+            // inspector arena. Fuse here so that the first user transaction's CallFrame
+            // starts from a clean arena.
+            executor.evm_mut().inspector_mut().fuse();
+
+            let mut senders = Vec::with_capacity(transaction_count);
+            let mut tx_traces = Vec::with_capacity(transaction_count);
+            let mut last_sent_len = 0usize;
+
+            let exec_span = debug_span!(target: "engine::tree", "execution").entered();
+            let mut transactions = handle.iter_transactions();
+            loop {
+                let wait_start = Instant::now();
+                let Some(tx_result) = transactions.next() else { break };
+                self.metrics.record_transaction_wait(wait_start.elapsed());
+
+                let tx = tx_result.map_err(BlockExecutionError::other)?;
+                senders.push(*tx.signer());
+
+                let _enter = debug_span!(
+                    target: "engine::tree",
+                    "execute tx",
+                    tx_index = senders.len() - 1,
+                )
+                .entered();
+                trace!(target: "engine::tree", "Executing transaction");
+
+                let tx_start = Instant::now();
+                let gas_output =
+                    executor.execute_transaction(tx).map_err(BlockExecutionError::from)?;
+                self.metrics.record_transaction_execution(tx_start.elapsed());
+
+                // tx_gas_used matches receipt gasUsed and the Geth callTracer root gasUsed
+                // semantics. state_gas_used (Amsterdam EIP-8037) is tracked separately and must
+                // not be added here.
+                let gas_used = gas_output.tx_gas_used();
+                // GethDefaultTracingOptions::default() produces call tree structure
+                // (from/to/value/gas/type) without input/output bytes, which keeps
+                // trace size bounded and is sufficient for ExEx consumers.
+                let call_frame = executor
+                    .evm_mut()
+                    .inspector_mut()
+                    .geth_builder()
+                    .geth_call_traces(Default::default(), gas_used);
+                tx_traces.push(call_frame);
+                executor.evm_mut().inspector_mut().fuse();
+
+                executed_tx_index.store(senders.len(), Ordering::Relaxed);
+
+                let current_len = executor.receipts().len();
+                if current_len > last_sent_len {
+                    last_sent_len = current_len;
+                    if let Some(receipt) = executor.receipts().last() {
+                        let tx_index = current_len - 1;
+                        let _ = receipt_tx.send(IndexedReceipt::new(tx_index, receipt.clone()));
+                    }
+                }
+            }
+            drop(exec_span);
+            drop(receipt_tx);
+
+            let post_exec_start = Instant::now();
+            let (_evm, result) = debug_span!(target: "engine::tree", "BlockExecutor::finish")
+                .in_scope(|| executor.finish())
+                .map(|(evm, result)| (evm.into_db(), result))
+                .inspect_err(|_| {
+                    debug!(
+                        target: "engine::tree::payload_validator",
+                        tx_count = tx_traces.len(),
+                        "Discarding collected call traces: executor finish failed"
+                    );
+                })?;
+            self.metrics.record_post_execution(post_exec_start.elapsed());
+
+            (result, senders, Some(tx_traces))
+        };
 
         // Merge transitions into bundle state
         debug_span!(target: "engine::tree", "merge_transitions")
@@ -1001,88 +1086,7 @@ where
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block");
 
-        Ok((output, senders, result_rx))
-    }
-
-    /// Executes transactions and collects senders, streaming receipts to a background task.
-    ///
-    /// This method handles:
-    /// - Applying pre-execution changes (e.g., beacon root updates)
-    /// - Executing each transaction with timing metrics
-    /// - Streaming receipts to the receipt root computation task
-    /// - Collecting transaction senders for later use
-    ///
-    /// Returns the executor (for finalization) and the collected senders.
-    fn execute_transactions<E, Tx, InnerTx, Err>(
-        &self,
-        mut executor: E,
-        transaction_count: usize,
-        transactions: impl Iterator<Item = Result<Tx, Err>>,
-        receipt_tx: &crossbeam_channel::Sender<IndexedReceipt<N::Receipt>>,
-        executed_tx_index: &AtomicUsize,
-    ) -> Result<(E, Vec<Address>), BlockExecutionError>
-    where
-        E: BlockExecutor<Receipt = N::Receipt>,
-        Tx: alloy_evm::block::ExecutableTx<E> + alloy_evm::RecoveredTx<InnerTx>,
-        InnerTx: TxHashRef,
-        Err: core::error::Error + Send + Sync + 'static,
-    {
-        let mut senders = Vec::with_capacity(transaction_count);
-
-        // Apply pre-execution changes (e.g., beacon root update)
-        let pre_exec_start = Instant::now();
-        debug_span!(target: "engine::tree", "pre_execution")
-            .in_scope(|| executor.apply_pre_execution_changes())?;
-        self.metrics.record_pre_execution(pre_exec_start.elapsed());
-
-        // Execute transactions
-        let exec_span = debug_span!(target: "engine::tree", "execution").entered();
-        let mut transactions = transactions.into_iter();
-        // Some executors may execute transactions that do not append receipts during the
-        // main loop (e.g., system transactions whose receipts are added during finalization).
-        // In that case, invoking the callback on every transaction would resend the previous
-        // receipt with the same index and can panic the ordered root builder.
-        let mut last_sent_len = 0usize;
-        loop {
-            // Measure time spent waiting for next transaction from iterator
-            // (e.g., parallel signature recovery)
-            let wait_start = Instant::now();
-            let Some(tx_result) = transactions.next() else { break };
-            self.metrics.record_transaction_wait(wait_start.elapsed());
-
-            let tx = tx_result.map_err(BlockExecutionError::other)?;
-            let tx_signer = *<Tx as alloy_evm::RecoveredTx<InnerTx>>::signer(&tx);
-
-            senders.push(tx_signer);
-
-            let _enter = debug_span!(
-                target: "engine::tree",
-                "execute tx",
-                tx_index = senders.len() - 1,
-            )
-            .entered();
-            trace!(target: "engine::tree", "Executing transaction");
-
-            let tx_start = Instant::now();
-            executor.execute_transaction(tx)?;
-            self.metrics.record_transaction_execution(tx_start.elapsed());
-
-            // advance the shared counter so prewarm workers skip already-executed txs
-            executed_tx_index.store(senders.len(), Ordering::Relaxed);
-
-            let current_len = executor.receipts().len();
-            if current_len > last_sent_len {
-                last_sent_len = current_len;
-                // Send the latest receipt to the background task for incremental root computation.
-                if let Some(receipt) = executor.receipts().last() {
-                    let tx_index = current_len - 1;
-                    let _ = receipt_tx.send(IndexedReceipt::new(tx_index, receipt.clone()));
-                }
-            }
-        }
-        drop(exec_span);
-
-        Ok((executor, senders))
+        Ok((output, senders, result_rx, call_traces))
     }
 
     /// Compute state root for the given hashed post state in parallel.
@@ -1614,6 +1618,8 @@ where
     /// The validation hot path can return immediately after state root verification,
     /// while consumers (DB writes, overlay providers, proofs) get trie data either
     /// from the completed task or via fallback computation.
+    /// `call_traces`: per-transaction call traces from [`TracingInspector`], stored on the
+    /// returned [`ExecutedBlock`] for downstream ExEx consumers via [`CanonStateNotification`].
     fn spawn_deferred_trie_task(
         &self,
         block: RecoveredBlock<N::Block>,
@@ -1622,6 +1628,7 @@ where
         hashed_state: LazyHashedPostState,
         trie_output: Arc<TrieUpdates>,
         changeset_provider: impl TrieCursorFactory + Send + 'static,
+        call_traces: Option<Vec<CallFrame>>,
     ) -> ExecutedBlock<N> {
         // Capture parent hash and ancestor overlays for deferred trie input construction.
         let (anchor_hash, overlay_blocks) = ctx
@@ -1732,11 +1739,13 @@ where
             .executor()
             .spawn_blocking_named("trie-input", compute_trie_input_task);
 
-        ExecutedBlock::with_deferred_trie_data(
+        let mut executed_block = ExecutedBlock::with_deferred_trie_data(
             Arc::new(block),
             execution_outcome,
             deferred_trie_data,
-        )
+        );
+        executed_block.set_call_traces(call_traces);
+        executed_block
     }
 
     fn calculate_timing_stats(
