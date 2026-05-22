@@ -1804,7 +1804,7 @@ mod tests {
         let addr = Address::new([0x66; 20]);
 
         let mut block = builder.get_executed_block_with_number(1, B256::random());
-        block.set_call_traces(Some(vec![make_call_frame(addr)]));
+        block.call_traces = Some(vec![make_call_frame(addr)]);
 
         let chain = NewCanonicalChain::<EthPrimitives>::blocks_to_chain(&[block], true);
 
@@ -1821,8 +1821,8 @@ mod tests {
         let addr = Address::new([0x77; 20]);
 
         let mut block = builder.get_executed_block_with_number(1, B256::random());
-        block.set_call_traces(Some(vec![make_call_frame(addr)]));
-        block.set_call_traces(None);
+        block.call_traces = Some(vec![make_call_frame(addr)]);
+        block.call_traces = None;
 
         let chain = NewCanonicalChain::<EthPrimitives>::blocks_to_chain(&[block], true);
 
