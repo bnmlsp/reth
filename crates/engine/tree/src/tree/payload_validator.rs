@@ -1742,10 +1742,7 @@ where
             execution_outcome,
             deferred_trie_data,
         );
-        #[cfg(feature = "traces")]
-        {
-            executed_block.call_traces = call_traces;
-        }
+        executed_block.call_traces = call_traces;
         executed_block
     }
 
