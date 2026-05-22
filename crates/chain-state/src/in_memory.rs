@@ -767,7 +767,7 @@ pub struct ExecutedBlock<N: NodePrimitives = EthPrimitives> {
     /// Always populated for Engine path blocks regardless of whether any ExEx subscribers exist.
     /// `None` for pipeline (historical) blocks.
     #[cfg(feature = "traces")]
-    call_traces: Option<Vec<CallFrame>>,
+    pub call_traces: Option<Vec<CallFrame>>,
 }
 
 impl<N: NodePrimitives> Default for ExecutedBlock<N> {
@@ -921,14 +921,6 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         self.recovered_block.header().number()
     }
 
-    /// Sets the call traces for this block.
-    ///
-    /// Pass `Some` for Engine path blocks after execution; pass `None` to clear.
-    /// Pipeline blocks leave this as `None` (never call this method).
-    #[cfg(feature = "traces")]
-    pub fn set_call_traces(&mut self, traces: Option<Vec<CallFrame>>) {
-        self.call_traces = traces;
-    }
 
 }
 
@@ -1028,6 +1020,8 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
                     let traces: BTreeMap<_, _> = blocks
                         .iter()
                         .filter_map(|b| {
+                            // Clone here: Chain takes ownership; ExecutedBlock may be retained
+                            // in the in-memory state concurrently.
                             b.call_traces.as_ref().map(|t| (b.block_number(), t.clone()))
                         })
                         .collect();

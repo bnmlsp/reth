@@ -1618,8 +1618,6 @@ where
     /// The validation hot path can return immediately after state root verification,
     /// while consumers (DB writes, overlay providers, proofs) get trie data either
     /// from the completed task or via fallback computation.
-    /// `call_traces`: per-transaction call traces from [`TracingInspector`], stored on the
-    /// returned [`ExecutedBlock`] for downstream ExEx consumers via [`CanonStateNotification`].
     fn spawn_deferred_trie_task(
         &self,
         block: RecoveredBlock<N::Block>,
@@ -1744,7 +1742,10 @@ where
             execution_outcome,
             deferred_trie_data,
         );
-        executed_block.set_call_traces(call_traces);
+        #[cfg(feature = "traces")]
+        {
+            executed_block.call_traces = call_traces;
+        }
         executed_block
     }
 

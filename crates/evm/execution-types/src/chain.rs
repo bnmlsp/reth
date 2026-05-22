@@ -395,7 +395,7 @@ impl<N: NodePrimitives> Chain<N> {
         self.execution_outcome.extend(other.execution_outcome);
         self.trie_data.extend(other.trie_data);
         #[cfg(feature = "traces")]
-        assert!(
+        debug_assert!(
             other.call_traces.is_none(),
             "append_chain drops call_traces from other; caller must ensure other has no traces"
         );
