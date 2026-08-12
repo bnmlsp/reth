@@ -5,6 +5,8 @@ use crate::{
     ChainInfoTracker, MemoryOverlayStateProvider,
 };
 use alloy_consensus::{transaction::TransactionMeta, BlockHeader};
+#[cfg(feature = "traces")]
+use alloy_rpc_types_trace::geth::CallFrame;
 use alloy_eips::{BlockHashOrNumber, BlockNumHash};
 use alloy_primitives::{map::B256Map, BlockNumber, TxHash, B256};
 use parking_lot::RwLock;
@@ -759,6 +761,10 @@ pub struct ExecutedBlock<N: NodePrimitives = EthPrimitives> {
     /// This allows deferring the computation of the trie data which can be expensive.
     /// The data can be populated asynchronously after the block was validated.
     pub trie_data: LazyTrieData,
+    /// Call traces collected during Engine path execution.
+    /// `None` for pipeline (historical) blocks and BAL-executed blocks.
+    #[cfg(feature = "traces")]
+    pub call_traces: Option<Vec<CallFrame>>,
 }
 
 impl<N: NodePrimitives> Default for ExecutedBlock<N> {
@@ -775,6 +781,8 @@ impl<N: NodePrimitives> Default for ExecutedBlock<N> {
                 state: Default::default(),
             }),
             trie_data: LazyTrieData::ready(ComputedTrieData::default()),
+            #[cfg(feature = "traces")]
+            call_traces: None,
         }
     }
 }
@@ -797,7 +805,13 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         execution_output: Arc<BlockExecutionOutput<N::Receipt>>,
         trie_data: ComputedTrieData,
     ) -> Self {
-        Self { recovered_block, execution_output, trie_data: LazyTrieData::ready(trie_data) }
+        Self {
+            recovered_block,
+            execution_output,
+            trie_data: LazyTrieData::ready(trie_data),
+            #[cfg(feature = "traces")]
+            call_traces: None,
+        }
     }
 
     /// Create a new [`ExecutedBlock`] with deferred trie data.
@@ -818,7 +832,13 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         execution_output: Arc<BlockExecutionOutput<N::Receipt>>,
         trie_data: LazyTrieData,
     ) -> Self {
-        Self { recovered_block, execution_output, trie_data }
+        Self {
+            recovered_block,
+            execution_output,
+            trie_data,
+            #[cfg(feature = "traces")]
+            call_traces: None,
+        }
     }
 
     /// Returns a reference to an inner [`SealedBlock`]
@@ -952,6 +972,20 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
                         exec.trie_data_handle(),
                     );
                 }
+
+                #[cfg(feature = "traces")]
+                {
+                    let traces: BTreeMap<_, _> = blocks
+                        .iter()
+                        .filter_map(|b| {
+                            b.call_traces.as_ref().map(|t| (b.block_number(), t.clone()))
+                        })
+                        .collect();
+                    if !traces.is_empty() {
+                        chain = chain.with_call_traces(traces);
+                    }
+                }
+
                 chain
             }
         }
@@ -1594,5 +1628,120 @@ mod tests {
                 ))
             }
         );
+    }
+
+    #[cfg(feature = "traces")]
+    mod traces_tests {
+        use super::*;
+        use alloy_rpc_types_trace::geth::CallFrame;
+        use reth_ethereum_primitives::EthPrimitives;
+
+        fn make_call_frame(from: Address) -> CallFrame {
+            CallFrame { from, ..Default::default() }
+        }
+
+        #[test]
+        fn test_blocks_to_chain_injects_traces() {
+            let mut builder: TestBlockBuilder<EthPrimitives> = TestBlockBuilder::default();
+            let mut block = builder.get_executed_block_with_number(1, B256::random());
+            let addr = Address::new([0xAA; 20]);
+            block.call_traces = Some(vec![make_call_frame(addr)]);
+
+            let chain =
+                NewCanonicalChain::<EthPrimitives>::blocks_to_chain(&[block]);
+            let traces = chain.call_traces().expect("traces should be Some");
+            assert_eq!(traces.len(), 1);
+            assert_eq!(traces[&1][0].from, addr);
+        }
+
+        #[test]
+        fn test_blocks_to_chain_no_traces_when_none() {
+            let mut builder: TestBlockBuilder<EthPrimitives> = TestBlockBuilder::default();
+            let block = builder.get_executed_block_with_number(1, B256::random());
+
+            let chain =
+                NewCanonicalChain::<EthPrimitives>::blocks_to_chain(&[block]);
+            assert!(chain.call_traces().is_none());
+        }
+
+        #[test]
+        fn test_blocks_to_chain_partial_traces_for_mixed_blocks() {
+            let mut builder: TestBlockBuilder<EthPrimitives> = TestBlockBuilder::default();
+            let mut block1 = builder.get_executed_block_with_number(1, B256::random());
+            let block2 = builder.get_executed_block_with_number(
+                2,
+                block1.recovered_block().hash(),
+            );
+
+            let addr = Address::new([0xBB; 20]);
+            block1.call_traces = Some(vec![make_call_frame(addr)]);
+
+            let chain =
+                NewCanonicalChain::<EthPrimitives>::blocks_to_chain(&[block1, block2]);
+            let traces = chain.call_traces().expect("traces should be Some");
+            assert_eq!(traces.len(), 1);
+            assert!(traces.contains_key(&1));
+            assert!(!traces.contains_key(&2));
+        }
+
+        #[test]
+        fn test_to_chain_notification_commit_includes_traces() {
+            let mut builder: TestBlockBuilder<EthPrimitives> = TestBlockBuilder::default();
+            let mut block = builder.get_executed_block_with_number(0, B256::random());
+            let addr = Address::new([0xDD; 20]);
+            block.call_traces = Some(vec![make_call_frame(addr)]);
+
+            let chain = NewCanonicalChain::Commit { new: vec![block] };
+            let notification = chain.to_chain_notification();
+
+            match notification {
+                CanonStateNotification::Commit { new } => {
+                    let traces = new.call_traces().expect("commit should have traces");
+                    assert_eq!(traces[&0][0].from, addr);
+                }
+                _ => panic!("expected Commit"),
+            }
+        }
+
+        #[test]
+        fn test_to_chain_notification_reorg_traces() {
+            let mut builder: TestBlockBuilder<EthPrimitives> = TestBlockBuilder::default();
+            let parent = B256::random();
+            let mut new_block = builder.get_executed_block_with_number(1, parent);
+            let old_block = builder.get_executed_block_with_number(1, parent);
+
+            let new_addr = Address::new([0xEE; 20]);
+            new_block.call_traces = Some(vec![make_call_frame(new_addr)]);
+            // old_block.call_traces is None by default
+
+            let chain = NewCanonicalChain::Reorg {
+                new: vec![new_block],
+                old: vec![old_block],
+            };
+            let notification = chain.to_chain_notification();
+
+            match notification {
+                CanonStateNotification::Reorg { new, old } => {
+                    let new_traces = new.call_traces().expect("new chain should have traces");
+                    assert_eq!(new_traces[&1][0].from, new_addr);
+                    assert!(old.call_traces().is_none());
+                }
+                _ => panic!("expected Reorg"),
+            }
+        }
+
+        #[test]
+        fn test_set_call_traces_field() {
+            let mut builder: TestBlockBuilder<EthPrimitives> = TestBlockBuilder::default();
+            let mut block = builder.get_executed_block_with_number(5, B256::random());
+            assert!(block.call_traces.is_none());
+
+            let addr = Address::new([0x11; 20]);
+            block.call_traces = Some(vec![make_call_frame(addr)]);
+            assert_eq!(block.call_traces.as_ref().unwrap()[0].from, addr);
+
+            block.call_traces = None;
+            assert!(block.call_traces.is_none());
+        }
     }
 }

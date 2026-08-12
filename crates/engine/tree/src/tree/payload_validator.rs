@@ -108,6 +108,8 @@ use alloy_consensus::transaction::{Either, TxHashRef};
 use alloy_eip7928::{bal::DecodedBal, compute_block_access_list_hash, BlockAccessList};
 use alloy_eips::{eip1898::BlockWithParent, eip4895::Withdrawal, NumHash};
 use alloy_evm::Evm;
+use alloy_rpc_types_trace::geth::CallFrame;
+use revm_inspectors::tracing::{TracingInspector, TracingInspectorConfig};
 use alloy_primitives::{
     map::{AddressMap, B256Set},
     B256,
@@ -712,7 +714,7 @@ where
         if let (Some(metrics), Some(stats)) = (&state_provider_metrics, &state_provider_stats) {
             metrics.record_totals(stats);
         }
-        let (output, senders, receipt_root_rx, built_bal) = ensure_ok!(execution_result);
+        let (output, senders, receipt_root_rx, built_bal, call_traces) = ensure_ok!(execution_result);
 
         // After executing the block we can stop prewarming transactions
         handle.stop_prewarming_execution();
@@ -878,13 +880,14 @@ where
             let _ = valid_block_tx.send(());
         }
 
-        let executed_block = self.spawn_deferred_trie_task(
+        let mut executed_block = self.spawn_deferred_trie_task(
             Arc::new(block),
             output,
             hashed_state,
             trie_output,
             changed_paths,
         );
+        executed_block.call_traces = call_traces;
         let raw_bal = decoded_bal.map(|decoded_bal| decoded_bal.as_raw_bal().clone());
         Ok(ValidationOutput::new(executed_block, timing_stats).with_raw_bal(raw_bal))
     }
@@ -982,6 +985,7 @@ where
             Vec<Address>,
             ReceiptRootReceiver,
             Option<BlockAccessList>,
+            Option<Vec<CallFrame>>,
         ),
         InsertBlockErrorKind,
     >
@@ -1007,7 +1011,8 @@ where
             let _span = debug_span!(target: "engine::tree", "create_evm").entered();
             let spec_id = *env.evm_env.spec_id();
             let evm_config = self.evm_config.clone().with_jit_support();
-            let evm = evm_config.evm_with_env(&mut db, env.evm_env);
+            let inspector = TracingInspector::new(TracingInspectorConfig::none());
+            let evm = evm_config.evm_with_env_and_inspector(&mut db, env.evm_env, inspector);
             let ctx = self
                 .execution_ctx_for(input)
                 .map_err(|e| InsertBlockErrorKind::Other(Box::new(e)))?;
@@ -1042,7 +1047,7 @@ where
         let execution_start = Instant::now();
 
         // Execute all transactions and finalize
-        let (executor, senders) = self.execute_transactions(
+        let (executor, senders, call_traces) = self.execute_transactions_traced(
             executor,
             transaction_count,
             handle.iter_transactions(),
@@ -1071,7 +1076,7 @@ where
         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block");
 
-        Ok((output, senders, result_rx, built_bal))
+        Ok((output, senders, result_rx, built_bal, Some(call_traces)))
     }
 
     /// Returns true when the BAL execute path should be used for this block.
@@ -1118,6 +1123,7 @@ where
             Vec<Address>,
             ReceiptRootReceiver,
             Option<BlockAccessList>,
+            Option<Vec<CallFrame>>,
         ),
         InsertBlockErrorKind,
     >
@@ -1165,7 +1171,7 @@ where
             "Executed block via BAL path",
         );
 
-        Ok((output, senders, result_rx, Some(built_bal)))
+        Ok((output, senders, result_rx, Some(built_bal), None))
     }
 
     fn spawn_receipt_root_task(
@@ -1190,6 +1196,8 @@ where
     /// - Collecting transaction senders for later use
     ///
     /// Returns the executor (for finalization) and the collected senders.
+    // Kept for upstream merge compatibility; see execute_transactions_traced.
+    #[allow(dead_code)]
     fn execute_transactions<'a, E, Tx, InnerTx, Err, DB>(
         &self,
         mut executor: E,
@@ -1276,6 +1284,105 @@ where
         drop(exec_span);
 
         Ok((executor, senders))
+    }
+
+    /// Executes transactions with tracing, collecting per-transaction call frames.
+    ///
+    /// Same logic as [`Self::execute_transactions`] with tracing additions:
+    /// - Fuses the inspector after pre-execution to discard system call traces
+    /// - After each transaction: extracts call trace via `geth_call_traces`, then fuses
+    // See also: execute_transactions (keep in sync for non-tracing logic)
+    fn execute_transactions_traced<'a, E, Tx, InnerTx, Err, DB>(
+        &self,
+        mut executor: E,
+        transaction_count: usize,
+        transactions: impl Iterator<Item = Result<Tx, Err>>,
+        receipt_tx: &crossbeam_channel::Sender<IndexedReceipt<N::Receipt>>,
+        executed_tx_index: &AtomicUsize,
+        has_bal: bool,
+    ) -> Result<(E, Vec<Address>, Vec<CallFrame>), BlockExecutionError>
+    where
+        E: BlockExecutor<
+            Receipt = N::Receipt,
+            Evm: alloy_evm::Evm<DB = &'a mut State<DB>, Inspector = TracingInspector>,
+        >,
+        Tx: alloy_evm::block::ExecutableTx<E> + alloy_evm::RecoveredTx<InnerTx>,
+        InnerTx: TxHashRef,
+        DB: revm::Database + 'a,
+        Err: core::error::Error + Send + Sync + 'static,
+    {
+        let mut senders = Vec::with_capacity(transaction_count);
+        let mut tx_traces = Vec::with_capacity(transaction_count);
+
+        let pre_exec_start = Instant::now();
+        debug_span!(target: "engine::tree", "pre_execution")
+            .in_scope(|| executor.apply_pre_execution_changes())?;
+        self.metrics.record_pre_execution(pre_exec_start.elapsed());
+
+        // Fuse inspector to discard system call traces from pre-execution
+        executor.evm_mut().inspector_mut().fuse();
+
+        if has_bal {
+            executor.evm_mut().db_mut().bump_bal_index();
+        }
+
+        let exec_span = debug_span!(target: "engine::tree", "execution").entered();
+        let mut transactions = transactions.into_iter();
+        let mut last_sent_len = 0usize;
+        loop {
+            let wait_start = Instant::now();
+            let Some(tx_result) = transactions.next() else { break };
+            self.metrics.record_transaction_wait(wait_start.elapsed());
+
+            let tx = tx_result.map_err(BlockExecutionError::other)?;
+            let tx_signer = *<Tx as alloy_evm::RecoveredTx<InnerTx>>::signer(&tx);
+
+            senders.push(tx_signer);
+
+            let _enter = tracing::enabled!(target: "engine::tree", Level::TRACE).then(|| {
+                tracing::trace_span!(
+                    target: "engine::tree",
+                    "execute tx",
+                    tx_index = senders.len() - 1,
+                )
+                .entered()
+            });
+            if tracing::enabled!(target: "engine::tree", Level::TRACE) {
+                trace!(target: "engine::tree", "Executing transaction");
+            }
+
+            let tx_start = Instant::now();
+            let gas_output = executor.execute_transaction(tx)?;
+            self.metrics.record_transaction_execution(tx_start.elapsed());
+
+            // Extract call trace for this transaction
+            let gas_used = gas_output.tx_gas_used();
+            let frame = executor
+                .evm_mut()
+                .inspector_mut()
+                .geth_builder()
+                .geth_call_traces(Default::default(), gas_used);
+            tx_traces.push(frame);
+            executor.evm_mut().inspector_mut().fuse();
+
+            executed_tx_index.store(senders.len(), Ordering::Relaxed);
+
+            let current_len = executor.receipts().len();
+            if current_len > last_sent_len {
+                last_sent_len = current_len;
+                if let Some(receipt) = executor.receipts().last() {
+                    let tx_index = current_len - 1;
+                    let _ = receipt_tx.send(IndexedReceipt::new(tx_index, receipt.clone()));
+                }
+            }
+            if has_bal {
+                executor.evm_mut().db_mut().bump_bal_index();
+            }
+        }
+
+        drop(exec_span);
+
+        Ok((executor, senders, tx_traces))
     }
 
     /// Validates the block after execution.
