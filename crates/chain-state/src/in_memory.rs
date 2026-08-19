@@ -768,6 +768,9 @@ pub struct ExecutedBlock<N: NodePrimitives = EthPrimitives> {
     /// This allows deferring the computation of the trie data which can be expensive.
     /// The data can be populated asynchronously after the block was validated.
     pub trie_data: LazyTrieData,
+    /// Per-transaction call traces collected during Engine path execution.
+    #[cfg(feature = "traces")]
+    pub call_traces: Option<Vec<alloy_rpc_types_trace::geth::CallFrame>>,
 }
 
 impl<N: NodePrimitives> Default for ExecutedBlock<N> {
@@ -784,6 +787,8 @@ impl<N: NodePrimitives> Default for ExecutedBlock<N> {
                 state: Default::default(),
             }),
             trie_data: LazyTrieData::ready(ComputedTrieData::default()),
+            #[cfg(feature = "traces")]
+            call_traces: None,
         }
     }
 }
@@ -806,7 +811,13 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         execution_output: Arc<BlockExecutionOutput<N::Receipt>>,
         trie_data: ComputedTrieData,
     ) -> Self {
-        Self { recovered_block, execution_output, trie_data: LazyTrieData::ready(trie_data) }
+        Self {
+            recovered_block,
+            execution_output,
+            trie_data: LazyTrieData::ready(trie_data),
+            #[cfg(feature = "traces")]
+            call_traces: None,
+        }
     }
 
     /// Create a new [`ExecutedBlock`] with deferred trie data.
@@ -827,7 +838,13 @@ impl<N: NodePrimitives> ExecutedBlock<N> {
         execution_output: Arc<BlockExecutionOutput<N::Receipt>>,
         trie_data: LazyTrieData,
     ) -> Self {
-        Self { recovered_block, execution_output, trie_data }
+        Self {
+            recovered_block,
+            execution_output,
+            trie_data,
+            #[cfg(feature = "traces")]
+            call_traces: None,
+        }
     }
 
     /// Returns a reference to an inner [`SealedBlock`]
@@ -961,6 +978,20 @@ impl<N: NodePrimitives<SignedTx: SignedTransaction>> NewCanonicalChain<N> {
                         exec.trie_data_handle(),
                     );
                 }
+
+                #[cfg(feature = "traces")]
+                {
+                    let traces: BTreeMap<_, _> = blocks
+                        .iter()
+                        .filter_map(|b| {
+                            b.call_traces.as_ref().map(|t| (b.block_number(), t.clone()))
+                        })
+                        .collect();
+                    if !traces.is_empty() {
+                        chain = chain.with_call_traces(traces);
+                    }
+                }
+
                 chain
             }
         }
@@ -1603,5 +1634,128 @@ mod tests {
                 ))
             }
         );
+    }
+
+    #[cfg(feature = "traces")]
+    mod trace_tests {
+        use super::*;
+        use crate::test_utils::TestBlockBuilder;
+        use alloy_primitives::B256;
+        use alloy_rpc_types_trace::geth::CallFrame;
+        use reth_ethereum_primitives::EthPrimitives;
+
+        fn make_executed_block_with_traces(
+            builder: &mut TestBlockBuilder<EthPrimitives>,
+            number: u64,
+            traces: Option<Vec<CallFrame>>,
+        ) -> ExecutedBlock<EthPrimitives> {
+            let mut block = builder.get_executed_block_with_number(number, B256::random());
+            block.call_traces = traces;
+            block
+        }
+
+        #[test]
+        fn test_blocks_to_chain_injects_traces() {
+            let mut builder = TestBlockBuilder::default();
+            let blocks = vec![
+                make_executed_block_with_traces(&mut builder, 1, Some(vec![CallFrame::default()])),
+                make_executed_block_with_traces(&mut builder, 2, Some(vec![CallFrame::default()])),
+            ];
+            let chain = NewCanonicalChain::Commit { new: blocks };
+            let notification = chain.to_chain_notification();
+            if let CanonStateNotification::Commit { new } = notification {
+                let traces = new.call_traces().unwrap();
+                assert_eq!(traces.len(), 2);
+                assert!(traces.contains_key(&1));
+                assert!(traces.contains_key(&2));
+            } else {
+                panic!("expected Commit");
+            }
+        }
+
+        #[test]
+        fn test_blocks_to_chain_no_traces_when_none() {
+            let mut builder = TestBlockBuilder::default();
+            let blocks = vec![
+                make_executed_block_with_traces(&mut builder, 1, None),
+                make_executed_block_with_traces(&mut builder, 2, None),
+            ];
+            let chain = NewCanonicalChain::Commit { new: blocks };
+            let notification = chain.to_chain_notification();
+            if let CanonStateNotification::Commit { new } = notification {
+                assert!(new.call_traces().is_none());
+            } else {
+                panic!("expected Commit");
+            }
+        }
+
+        #[test]
+        fn test_blocks_to_chain_partial_traces() {
+            let mut builder = TestBlockBuilder::default();
+            let blocks = vec![
+                make_executed_block_with_traces(&mut builder, 1, Some(vec![CallFrame::default()])),
+                make_executed_block_with_traces(&mut builder, 2, None),
+                make_executed_block_with_traces(&mut builder, 3, Some(vec![CallFrame::default()])),
+            ];
+            let chain = NewCanonicalChain::Commit { new: blocks };
+            let notification = chain.to_chain_notification();
+            if let CanonStateNotification::Commit { new } = notification {
+                let traces = new.call_traces().unwrap();
+                assert_eq!(traces.len(), 2);
+                assert!(traces.contains_key(&1));
+                assert!(!traces.contains_key(&2));
+                assert!(traces.contains_key(&3));
+            } else {
+                panic!("expected Commit");
+            }
+        }
+
+        #[test]
+        fn test_blocks_to_chain_empty_block_traces() {
+            let mut builder = TestBlockBuilder::default();
+            let blocks = vec![
+                make_executed_block_with_traces(&mut builder, 1, Some(vec![])),
+                make_executed_block_with_traces(&mut builder, 2, Some(vec![CallFrame::default()])),
+            ];
+            let chain = NewCanonicalChain::Commit { new: blocks };
+            let notification = chain.to_chain_notification();
+            if let CanonStateNotification::Commit { new } = notification {
+                let traces = new.call_traces().unwrap();
+                assert_eq!(traces.len(), 2);
+                assert_eq!(traces[&1].len(), 0);
+                assert_eq!(traces[&2].len(), 1);
+            } else {
+                panic!("expected Commit");
+            }
+        }
+
+        #[test]
+        fn test_to_chain_notification_reorg_traces() {
+            let mut builder = TestBlockBuilder::default();
+            let new_blocks = vec![
+                make_executed_block_with_traces(&mut builder, 1, Some(vec![CallFrame::default()])),
+            ];
+            let old_blocks =
+                vec![make_executed_block_with_traces(&mut builder, 1, None)];
+            let chain = NewCanonicalChain::Reorg { new: new_blocks, old: old_blocks };
+            let notification = chain.to_chain_notification();
+            if let CanonStateNotification::Reorg { new, old } = notification {
+                assert!(new.call_traces().is_some());
+                assert!(old.call_traces().is_none());
+            } else {
+                panic!("expected Reorg");
+            }
+        }
+
+        #[test]
+        fn test_set_call_traces_field() {
+            let mut builder: TestBlockBuilder<EthPrimitives> = TestBlockBuilder::default();
+            let mut block = builder.get_executed_block_with_number(1, B256::random());
+            assert!(block.call_traces.is_none());
+            block.call_traces = Some(vec![CallFrame::default()]);
+            assert_eq!(block.call_traces.as_ref().unwrap().len(), 1);
+            block.call_traces = None;
+            assert!(block.call_traces.is_none());
+        }
     }
 }
