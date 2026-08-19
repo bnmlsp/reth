@@ -27,6 +27,7 @@ reth-trie.workspace = true
 alloy-eips.workspace = true
 alloy-primitives = { workspace = true, features = ["std"] }
 alloy-consensus.workspace = true
+alloy-rpc-types-trace = { workspace = true, optional = true }
 revm.workspace = true
 
 # async
@@ -81,3 +82,4 @@ test-utils = [
     "reth-ethereum-primitives/test-utils",
     "reth-trie-sparse/test-utils",
 ]
+traces = ["dep:alloy-rpc-types-trace", "reth-execution-types/traces"]
