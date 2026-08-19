@@ -8,6 +8,8 @@ use alloy_consensus::{
 };
 use alloy_eips::{eip1898::ForkBlock, BlockNumHash};
 use alloy_primitives::{map::HashSet, Address, BlockHash, BlockNumber, Log, TxHash};
+#[cfg(feature = "traces")]
+use alloy_rpc_types_trace::geth::CallFrame;
 use core::{fmt, ops::RangeInclusive};
 use reth_primitives_traits::{
     transaction::signed::SignedTransaction, Block, BlockBody, IndexedTx, NodePrimitives,
@@ -41,6 +43,10 @@ pub struct Chain<N: NodePrimitives = reth_ethereum_primitives::EthPrimitives> {
     ///
     /// Contains handles to lazily-initialized sorted trie updates and hashed state.
     trie_data: BTreeMap<BlockNumber, LazyTrieData>,
+    /// Per-block call traces collected during Engine path execution.
+    #[cfg(feature = "traces")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    call_traces: Option<BTreeMap<BlockNumber, Vec<CallFrame>>>,
 }
 
 type ChainTxReceiptMeta<'a, N> = (
@@ -56,6 +62,8 @@ impl<N: NodePrimitives> Default for Chain<N> {
             blocks: Default::default(),
             execution_outcome: Default::default(),
             trie_data: Default::default(),
+            #[cfg(feature = "traces")]
+            call_traces: None,
         }
     }
 }
@@ -80,7 +88,13 @@ impl<N: NodePrimitives> Chain<N> {
             .collect::<BTreeMap<_, _>>();
         debug_assert!(!blocks.is_empty(), "Chain should have at least one block");
 
-        Self { blocks, execution_outcome, trie_data }
+        Self {
+            blocks,
+            execution_outcome,
+            trie_data,
+            #[cfg(feature = "traces")]
+            call_traces: None,
+        }
     }
 
     /// Create new Chain from a single block and its state.
@@ -359,12 +373,28 @@ impl<N: NodePrimitives> Chain<N> {
             return Err(other)
         }
 
+        #[cfg(feature = "traces")]
+        debug_assert!(other.call_traces.is_none(), "appended chain should not carry call_traces");
+
         // Insert blocks from other chain
         self.blocks.extend(other.blocks);
         self.execution_outcome.extend(other.execution_outcome);
         self.trie_data.extend(other.trie_data);
 
         Ok(())
+    }
+
+    /// Set per-block call traces for this chain.
+    #[cfg(feature = "traces")]
+    pub fn with_call_traces(mut self, traces: BTreeMap<BlockNumber, Vec<CallFrame>>) -> Self {
+        self.call_traces = Some(traces);
+        self
+    }
+
+    /// Get per-block call traces, if available.
+    #[cfg(feature = "traces")]
+    pub fn call_traces(&self) -> Option<&BTreeMap<BlockNumber, Vec<CallFrame>>> {
+        self.call_traces.as_ref()
     }
 }
 
@@ -628,7 +658,13 @@ pub(super) mod serde_bincode_compat {
                 })
                 .collect();
 
-            Self { blocks, execution_outcome: value.execution_outcome.into(), trie_data }
+            Self {
+                blocks,
+                execution_outcome: value.execution_outcome.into(),
+                trie_data,
+                #[cfg(feature = "traces")]
+                call_traces: None,
+            }
         }
     }
 
@@ -868,5 +904,75 @@ mod tests {
 
         // Assert that the execution outcome at the tip block contains the whole execution outcome
         assert_eq!(chain.execution_outcome_at_block(11), Some(execution_outcome));
+    }
+
+    #[cfg(feature = "traces")]
+    mod trace_tests {
+        use super::*;
+        use alloy_rpc_types_trace::geth::CallFrame;
+
+        #[test]
+        fn test_chain_default_no_traces() {
+            let chain = Chain::<reth_ethereum_primitives::EthPrimitives>::default();
+            assert!(chain.call_traces().is_none());
+        }
+
+        #[test]
+        fn test_chain_with_call_traces() {
+            let chain = Chain::<reth_ethereum_primitives::EthPrimitives>::default();
+            let mut traces = BTreeMap::new();
+            traces.insert(1u64, vec![CallFrame::default()]);
+            traces.insert(2u64, vec![CallFrame::default(), CallFrame::default()]);
+            let chain = chain.with_call_traces(traces.clone());
+            let result = chain.call_traces().unwrap();
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[&1].len(), 1);
+            assert_eq!(result[&2].len(), 2);
+        }
+
+        #[test]
+        fn test_chain_new_no_traces() {
+            let block = Arc::new(RecoveredBlock::<
+                reth_ethereum_primitives::Block,
+            >::default());
+            let chain = Chain::<reth_ethereum_primitives::EthPrimitives>::new(
+                vec![block],
+                ExecutionOutcome::default(),
+                BTreeMap::new(),
+            );
+            assert!(chain.call_traces().is_none());
+        }
+
+        #[test]
+        fn test_chain_with_call_traces_replace() {
+            let chain = Chain::<reth_ethereum_primitives::EthPrimitives>::default();
+            let mut traces1 = BTreeMap::new();
+            traces1.insert(1u64, vec![CallFrame::default()]);
+            let chain = chain.with_call_traces(traces1);
+            assert_eq!(chain.call_traces().unwrap().len(), 1);
+
+            let mut traces2 = BTreeMap::new();
+            traces2.insert(10u64, vec![CallFrame::default()]);
+            traces2.insert(11u64, vec![CallFrame::default()]);
+            let chain = chain.with_call_traces(traces2);
+            assert_eq!(chain.call_traces().unwrap().len(), 2);
+            assert!(chain.call_traces().unwrap().contains_key(&10));
+        }
+
+        #[test]
+        fn test_chain_traces_dropped_on_roundtrip() {
+            // Verify that call_traces field has serde(skip) — constructing a Chain via
+            // serde_bincode_compat roundtrip always produces call_traces = None.
+            // This is guaranteed by the #[cfg_attr(feature = "serde", serde(skip))] attribute.
+            let chain = Chain::<reth_ethereum_primitives::EthPrimitives>::default();
+            let mut traces = BTreeMap::new();
+            traces.insert(1u64, vec![CallFrame::default()]);
+            let chain = chain.with_call_traces(traces);
+            assert!(chain.call_traces().is_some());
+
+            // After Default construction (simulating deserialization), traces are None
+            let deserialized = Chain::<reth_ethereum_primitives::EthPrimitives>::default();
+            assert!(deserialized.call_traces().is_none());
+        }
     }
 }

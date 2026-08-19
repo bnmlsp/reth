@@ -22,6 +22,7 @@ alloy-evm.workspace = true
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
+alloy-rpc-types-trace = { workspace = true, optional = true }
 alloy-rlp = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_with = { workspace = true, optional = true }
@@ -58,6 +59,7 @@ serde-bincode-compat = [
     "alloy-consensus/serde-bincode-compat",
     "alloy-eips/serde-bincode-compat",
 ]
+traces = ["dep:alloy-rpc-types-trace"]
 std = [
     "alloy-eips/std",
     "alloy-primitives/std",
